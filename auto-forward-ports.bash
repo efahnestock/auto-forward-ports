@@ -32,6 +32,9 @@ STATE_DIR=$(mktemp -d "/tmp/auto-forward-ports.${REMOTE_HOST}.XXXXXX")
 # Store port -> process description for display
 declare -A port_desc
 
+# Store remote_port -> local_port mapping
+declare -A port_map
+
 # Event log (recent events)
 declare -a event_log
 
@@ -53,6 +56,41 @@ red=$'\e[31m'
 cyan=$'\e[36m'
 reset=$'\e[0m'
 
+is_local_port_free() {
+    local port=$1
+    if command -v lsof &>/dev/null; then
+        ! lsof -iTCP:"$port" -sTCP:LISTEN -P -n &>/dev/null
+    elif command -v ss &>/dev/null; then
+        ! ss -tln sport = :"$port" 2>/dev/null | grep -q "LISTEN"
+    else
+        ! (echo >/dev/tcp/localhost/"$port") 2>/dev/null
+    fi
+}
+
+find_free_local_port() {
+    local start_port=$1
+    local port=$start_port
+    local max_port=$((start_port + 100))
+    while (( port <= max_port )); do
+        if is_local_port_free "$port"; then
+            # Also check we haven't already allocated this port in the current session
+            local already_mapped=0
+            for rp in "${!port_map[@]}"; do
+                if (( port_map[$rp] == port )); then
+                    already_mapped=1
+                    break
+                fi
+            done
+            if (( !already_mapped )); then
+                echo "$port"
+                return 0
+            fi
+        fi
+        (( port++ ))
+    done
+    return 1
+}
+
 cleanup() {
     # Show cursor, clear screen
     printf '\e[?25h'
@@ -61,11 +99,18 @@ cleanup() {
     shopt -s nullglob
     for f in "$STATE_DIR"/*; do
         [[ -f "$f" ]] || continue
-        local port
+        local port state pid local_port
         port=$(basename "$f")
-        local pid
-        pid=$(cat "$f")
-        kill "$pid" 2>/dev/null && echo "  ${red}Stopped${reset} port $port"
+        state=$(cat "$f")
+        pid="${state%% *}"
+        local_port="${state##* }"
+        if kill "$pid" 2>/dev/null; then
+            if [[ -n "$local_port" ]] && (( local_port != port )); then
+                echo "  ${red}Stopped${reset} port $port → $local_port"
+            else
+                echo "  ${red}Stopped${reset} port $port"
+            fi
+        fi
     done
     shopt -u nullglob
     rm -rf "$STATE_DIR"
@@ -134,21 +179,38 @@ start_forward() {
     if (( port < 1024 )); then
         return
     fi
-    ssh -N -L "${port}:localhost:${port}" "$REMOTE_HOST" 2>/dev/null &
+    local local_port
+    local_port=$(find_free_local_port "$port") || {
+        log_event "${red}!${reset} port ${bold}${port}${reset} ${dim}no free local port${reset}"
+        return 1
+    }
+    ssh -N -L "${local_port}:localhost:${port}" "$REMOTE_HOST" 2>/dev/null &
     local pid=$!
-    echo "$pid" > "$STATE_DIR/$port"
+    echo "$pid $local_port" > "$STATE_DIR/$port"
     port_desc[$port]="$proc"
-    log_event "${green}+${reset} port ${bold}${port}${reset} ${dim}${proc}${reset}"
+    port_map[$port]=$local_port
+    if (( local_port != port )); then
+        log_event "${green}+${reset} port ${bold}${port}${reset}${dim}→${reset}${bold}${local_port}${reset} ${dim}${proc}${reset}"
+    else
+        log_event "${green}+${reset} port ${bold}${port}${reset} ${dim}${proc}${reset}"
+    fi
 }
 
 stop_forward() {
     local port=$1
-    local pid
-    pid=$(cat "$STATE_DIR/$port" 2>/dev/null) || return
+    local state pid local_port
+    state=$(cat "$STATE_DIR/$port" 2>/dev/null) || return
+    pid="${state%% *}"
+    local_port="${state##* }"
     if kill "$pid" 2>/dev/null; then
-        log_event "${red}-${reset} port ${bold}${port}${reset} ${dim}${port_desc[$port]:-}${reset}"
+        if [[ -n "$local_port" ]] && (( local_port != port )); then
+            log_event "${red}-${reset} port ${bold}${port}${reset}${dim}→${reset}${bold}${local_port}${reset} ${dim}${port_desc[$port]:-}${reset}"
+        else
+            log_event "${red}-${reset} port ${bold}${port}${reset} ${dim}${port_desc[$port]:-}${reset}"
+        fi
     fi
     unset "port_desc[$port]"
+    unset "port_map[$port]"
     rm -f "$STATE_DIR/$port"
 }
 
@@ -182,17 +244,23 @@ redraw() {
         for port in "${sorted_ports[@]}"; do
             [[ -z "$port" ]] && continue
             local desc="${port_desc[$port]}"
+            local local_port="${port_map[$port]:-$port}"
             local indicator="${green}●${reset}"
             # Check if tunnel is alive
-            local spid
-            spid=$(cat "$STATE_DIR/$port" 2>/dev/null)
+            local state spid
+            state=$(cat "$STATE_DIR/$port" 2>/dev/null)
+            spid="${state%% *}"
             if [[ -n "$spid" ]] && ! kill -0 "$spid" 2>/dev/null; then
                 indicator="${yellow}○${reset}"
             fi
+            local port_display="$port"
+            if (( local_port != port )); then
+                port_display="${port} → ${local_port}"
+            fi
             if [[ -n "$desc" ]]; then
-                printf "  %s ${bold}%-6s${reset} ${dim}%s${reset}\n" "$indicator" "$port" "$desc"
+                printf "  %s ${bold}%-6s${reset} ${dim}%s${reset}\n" "$indicator" "$port_display" "$desc"
             else
-                printf "  %s ${bold}%-6s${reset}\n" "$indicator" "$port"
+                printf "  %s ${bold}%-6s${reset}\n" "$indicator" "$port_display"
             fi
             (( count++ ))
         done
@@ -240,9 +308,13 @@ while true; do
         else
             # Update description in case it changed
             port_desc[$port]="$proc"
-            pid=$(cat "$STATE_DIR/$port")
+            state=$(cat "$STATE_DIR/$port")
+            pid="${state%% *}"
+            local_port="${state##* }"
+            port_map[$port]="${local_port:-$port}"
             if ! kill -0 "$pid" 2>/dev/null; then
                 rm -f "$STATE_DIR/$port"
+                unset "port_map[$port]"
                 log_event "${yellow}↻${reset} port ${bold}${port}${reset} reconnecting"
                 start_forward "$port" "$proc"
                 changed=1
